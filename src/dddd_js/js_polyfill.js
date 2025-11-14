@@ -366,11 +366,11 @@ globalThis.__NEVER_JSCORE_EXTENSIONS_LOADED__ = true;
 /**
  * 提前返回函数（用于Hook拦截）
  *
- * 在逆向工程中，当你Hook了某个函数（如XMLHttpRequest.send）并获取到参数后，
+ * 在逆向工程中，当你Hook了某个函数并获取到参数后，
  * 可以调用此函数立即返回结果并终止JS执行。
  *
  * @param {*} value - 要返回的值
- * @throws {EarlyReturnSignal} 特殊异常用于终止执行
+ * @throws {Error} 抛出特殊错误来中断执行
  *
  * @example
  * // Hook XMLHttpRequest.send
@@ -378,10 +378,15 @@ globalThis.__NEVER_JSCORE_EXTENSIONS_LOADED__ = true;
  * XMLHttpRequest.prototype.send = function(data) {
  *     // 拦截参数并立即返回
  *     __neverjscore_return__({ intercepted: data });
- *     // 下面的代码不会执行
  * };
+ *
+ * 实现原理：
+ * 1. 调用 Rust op (op_early_return) 抛出自定义错误
+ * 2. 错误会中断 JS 执行并传播到 Rust 侧
+ * 3. Rust 侧捕获错误并提取返回值
  */
 globalThis.__neverjscore_return__ = function(value) {
+    // 调用 Rust op, 存储值并标记早期返回
     try {
         const json = JSON.stringify(value);
         Deno.core.ops.op_early_return(json);
@@ -390,7 +395,7 @@ globalThis.__neverjscore_return__ = function(value) {
         Deno.core.ops.op_early_return(JSON.stringify(String(value)));
     }
 
-    // 抛出特殊异常来终止执行
+    // 抛出错误来中断执行
     const error = new Error('[NEVER_JSCORE_EARLY_RETURN]');
     error.name = 'EarlyReturnSignal';
     error.__neverjscore_early_return__ = true;
@@ -404,100 +409,139 @@ globalThis.$exit = globalThis.__neverjscore_return__;
 log('Early return API loaded: __neverjscore_return__, $return, $exit');
 
 // ============================================
-// Timer API polyfills (REAL async timers)
+// Timer API - Real async timers using Rust ops
 // ============================================
 
 /**
- * Real async setTimeout using Rust ops
- * @param {Function} callback - 回调函数
- * @param {number} delay - 延迟时间（毫秒）
- * @param {...*} args - 传给回调的参数
- * @returns {number} timer ID
+ * Real Node.js-style timers using Rust async operations
+ * - setTimeout/setInterval with actual delays
+ * - Non-blocking (runs in background via Rust threads)
+ * - Integrates with event loop naturally
  */
+// Timer tracking for early exit support
+const __active_timers__ = new Set();
+const __timer_callbacks__ = new Map();
+
+// Function to clear ALL timers (for process.exit() behavior)
+globalThis.__neverjscore_clear_all_timers__ = function() {
+    log('[EARLY EXIT] Clearing all active timers');
+    for (const id of __active_timers__) {
+        Deno.core.ops.op_clear_timer(id);
+    }
+    __active_timers__.clear();
+    __timer_callbacks__.clear();
+};
+
 if (typeof setTimeout === 'undefined') {
-    // Track active timers in JavaScript (for both setTimeout and setInterval)
-    const activeTimers = new Set();
-
     globalThis.setTimeout = function(callback, delay = 0, ...args) {
-        const id = Deno.core.ops.op_get_timer_id();
-        activeTimers.add(id);  // Mark as active
+        const timerId = Deno.core.ops.op_get_timer_id();
+        log(`setTimeout called: id=${timerId}, delay=${delay}ms`);
 
-        log(`setTimeout called: id=${id}, delay=${delay}ms`);
+        // Track active timer
+        __active_timers__.add(timerId);
+        __timer_callbacks__.set(timerId, callback);
 
-        // Use real async timer from Rust
-        (async () => {
-            const shouldExecute = await Deno.core.ops.op_set_timeout_real(id, Math.max(0, delay | 0));
+        // Call async Rust op - returns a Promise that resolves after delay
+        Deno.core.ops.op_set_timeout_real(timerId, Math.max(0, delay)).then(shouldExecute => {
+            // Check if system has exited
+            if (globalThis.__neverjscore_exited__) {
+                __active_timers__.delete(timerId);
+                __timer_callbacks__.delete(timerId);
+                return;
+            }
 
-            // Check if timer was cleared during sleep
-            if (shouldExecute && activeTimers.has(id)) {
-                log(`setTimeout executing: id=${id}`);
+            if (shouldExecute && __active_timers__.has(timerId)) {
+                log(`Timer executing: id=${timerId}`);
+                __active_timers__.delete(timerId);
+                __timer_callbacks__.delete(timerId);
+
                 try {
                     callback(...args);
                 } catch (e) {
-                    console.error(`Error in setTimeout callback (id=${id}):`, e);
+                    // Re-throw EarlyReturnSignal to let event loop catch it
+                    if (e && e.__neverjscore_early_return__ === true) {
+                        log(`Timer callback triggered early return: id=${timerId}, re-throwing`);
+                        throw e;  // Re-throw to propagate to event loop
+                    }
+                    console.error(`Error in setTimeout callback (id=${timerId}):`, e);
                 }
-            } else if (!activeTimers.has(id)) {
-                log(`setTimeout cancelled: id=${id}`);
             }
+        });
 
-            // Clean up
-            activeTimers.delete(id);
-        })();
-
-        return id;
+        return timerId;
     };
 
     globalThis.setInterval = function(callback, delay = 0, ...args) {
-        const id = Deno.core.ops.op_get_timer_id();
-        activeTimers.add(id);  // Mark as active
+        const timerId = Deno.core.ops.op_get_timer_id();
+        log(`setInterval called: id=${timerId}, delay=${delay}ms`);
 
-        log(`setInterval called: id=${id}, delay=${delay}ms`);
+        // Track active timer
+        __active_timers__.add(timerId);
+        __timer_callbacks__.set(timerId, callback);
 
-        // setInterval: repeatedly schedule the callback
-        const intervalDelay = Math.max(0, delay | 0);
-
-        const scheduleNext = async () => {
-            // Check if timer was cleared before sleeping
-            if (!activeTimers.has(id)) {
-                log(`setInterval stopped (cleared before sleep): id=${id}`);
-                return;  // Stop recursion
+        // Recursive function to implement interval behavior
+        function scheduleNext() {
+            // Check if timer was cleared or system exited
+            if (!__active_timers__.has(timerId) || globalThis.__neverjscore_exited__) {
+                __active_timers__.delete(timerId);
+                __timer_callbacks__.delete(timerId);
+                return;
             }
 
-            const shouldExecute = await Deno.core.ops.op_set_interval_real(id, intervalDelay);
-
-            // Check again after sleeping (timer might have been cleared during sleep)
-            if (shouldExecute && activeTimers.has(id)) {
-                log(`setInterval executing: id=${id}`);
-                try {
-                    callback(...args);
-                } catch (e) {
-                    console.error(`Error in setInterval callback (id=${id}):`, e);
+            Deno.core.ops.op_set_interval_real(timerId, Math.max(0, delay)).then(shouldExecute => {
+                // Check again after waiting
+                if (!__active_timers__.has(timerId) || globalThis.__neverjscore_exited__) {
+                    __active_timers__.delete(timerId);
+                    __timer_callbacks__.delete(timerId);
+                    return;
                 }
-                // Schedule next execution only if still active
-                scheduleNext();
-            } else {
-                log(`setInterval stopped (cleared or cancelled): id=${id}`);
-                activeTimers.delete(id);  // Clean up
-            }
-        };
 
+                if (shouldExecute) {
+                    log(`Timer executing: id=${timerId}`);
+                    try {
+                        callback(...args);
+                    } catch (e) {
+                        // Re-throw EarlyReturnSignal to let event loop catch it
+                        if (e && e.__neverjscore_early_return__ === true) {
+                            log(`Timer callback triggered early return: id=${timerId}, re-throwing`);
+                            __active_timers__.delete(timerId);
+                            __timer_callbacks__.delete(timerId);
+                            throw e;  // Re-throw to propagate to event loop
+                        }
+                        console.error(`Error in setInterval callback (id=${timerId}):`, e);
+                    }
+
+                    // Re-schedule for next interval
+                    scheduleNext();
+                }
+            });
+        }
+
+        // Start the interval
         scheduleNext();
-        return id;
+
+        return timerId;
     };
 
     globalThis.clearTimeout = function(id) {
         log(`clearTimeout called: id=${id}`);
-        activeTimers.delete(id);  // Remove from active set (prevents execution)
-        Deno.core.ops.op_clear_timer(id);  // Clean up Rust side
+        if (id !== undefined && id !== null) {
+            __active_timers__.delete(id);
+            __timer_callbacks__.delete(id);
+            Deno.core.ops.op_clear_timer(id);
+        }
     };
 
     globalThis.clearInterval = function(id) {
         log(`clearInterval called: id=${id}`);
-        activeTimers.delete(id);  // Remove from active set (stops JS recursion)
-        Deno.core.ops.op_clear_timer(id);  // Clean up Rust side
+        if (id !== undefined && id !== null) {
+            __active_timers__.delete(id);
+            __timer_callbacks__.delete(id);
+            Deno.core.ops.op_clear_timer(id);
+        }
     };
 
-    log('Real async timers loaded: setTimeout, setInterval, clearTimeout, clearInterval');
+    log('Real async timers loaded: setTimeout, setInterval (Rust-backed)');
 }
 
 // ============================================
@@ -658,7 +702,12 @@ if (typeof process === 'undefined' || !process.version) {
 
         exit: function(code = 0) {
             log(`process.exit called: code=${code}`);
-            throw new Error(`Process exit requested with code: ${code}`);
+            // 使用 __neverjscore_return__ 实现真正的退出
+            __neverjscore_return__({
+                __process_exit__: true,
+                exitCode: code,
+                message: `Process exited with code ${code}`
+            });
         },
 
         hrtime: function(previousTimestamp) {
@@ -2001,6 +2050,154 @@ if (typeof console.table === 'undefined') {
 // Mark browser environment loaded
 globalThis.__NEVER_JSCORE_BROWSER_ENV_LOADED__ = true;
 
+
+// ============================================
+// Blob API
+// ============================================
+
+if (typeof Blob === 'undefined') {
+    class Blob {
+        constructor(blobParts = [], options = {}) {
+            this.type = options.type || '';
+            this.endings = options.endings || 'transparent';
+
+            // 将所有部分转换为字符串并拼接
+            this._parts = [];
+            this._size = 0;
+
+            if (Array.isArray(blobParts)) {
+                for (const part of blobParts) {
+                    if (part instanceof Blob) {
+                        // 如果是 Blob，复制其内容
+                        this._parts.push(...part._parts);
+                        this._size += part.size;
+                    } else if (part instanceof ArrayBuffer || ArrayBuffer.isView(part)) {
+                        // ArrayBuffer 或 TypedArray
+                        const bytes = new Uint8Array(
+                            part instanceof ArrayBuffer ? part : part.buffer
+                        );
+                        this._parts.push(bytes);
+                        this._size += bytes.byteLength;
+                    } else if (typeof part === 'string') {
+                        // 字符串：转换为 UTF-8 字节
+                        const encoder = new TextEncoder();
+                        const bytes = encoder.encode(part);
+                        this._parts.push(bytes);
+                        this._size += bytes.byteLength;
+                    } else {
+                        // 其他类型：转为字符串
+                        const str = String(part);
+                        const encoder = new TextEncoder();
+                        const bytes = encoder.encode(str);
+                        this._parts.push(bytes);
+                        this._size += bytes.byteLength;
+                    }
+                }
+            }
+        }
+
+        get size() {
+            return this._size;
+        }
+
+        /**
+         * 返回 Blob 的一部分作为新 Blob
+         * @param {number} start - 起始字节位置
+         * @param {number} end - 结束字节位置（不包含）
+         * @param {string} contentType - 新 Blob 的 MIME 类型
+         * @returns {Blob} 新的 Blob 对象
+         */
+        slice(start = 0, end = this._size, contentType = '') {
+            // 标准化参数
+            const normalizedStart = start < 0 ? Math.max(this._size + start, 0) : Math.min(start, this._size);
+            const normalizedEnd = end < 0 ? Math.max(this._size + end, 0) : Math.min(end, this._size);
+            const span = Math.max(normalizedEnd - normalizedStart, 0);
+
+            // 获取所有字节
+            const allBytes = this._getAllBytes();
+
+            // 切片
+            const slicedBytes = allBytes.slice(normalizedStart, normalizedStart + span);
+
+            // 创建新 Blob
+            const newBlob = new Blob([slicedBytes], { type: contentType || this.type });
+            return newBlob;
+        }
+
+        /**
+         * 读取 Blob 内容为文本
+         * @returns {Promise<string>} Blob 内容
+         */
+        async text() {
+            const bytes = this._getAllBytes();
+            const decoder = new TextDecoder();
+            return decoder.decode(bytes);
+        }
+
+        /**
+         * 读取 Blob 内容为 ArrayBuffer
+         * @returns {Promise<ArrayBuffer>} Blob 内容
+         */
+        async arrayBuffer() {
+            const bytes = this._getAllBytes();
+            return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+        }
+
+        /**
+         * 创建可读流（简化实现）
+         * @returns {ReadableStream} 可读流
+         */
+        stream() {
+            // 简化实现：返回一个 mock 对象
+            const bytes = this._getAllBytes();
+            return {
+                getReader: () => ({
+                    read: async () => ({
+                        value: bytes,
+                        done: false
+                    }),
+                    releaseLock: () => {}
+                })
+            };
+        }
+
+        /**
+         * 获取所有字节（内部方法）
+         * @private
+         * @returns {Uint8Array} 所有字节
+         */
+        _getAllBytes() {
+            if (this._parts.length === 0) {
+                return new Uint8Array(0);
+            }
+
+            // 合并所有部分
+            const result = new Uint8Array(this._size);
+            let offset = 0;
+            for (const part of this._parts) {
+                result.set(part, offset);
+                offset += part.byteLength;
+            }
+            return result;
+        }
+
+        /**
+         * 返回 Blob 类型字符串
+         * @returns {string} "[object Blob]"
+         */
+        toString() {
+            return '[object Blob]';
+        }
+    }
+
+    globalThis.Blob = Blob;
+    log('Blob API loaded');
+}
+
+// Object URL 存储（用于 createObjectURL / revokeObjectURL）
+const _objectURLStore = new Map();
+let _objectURLCounter = 0;
+
 // ============================================
 // URL and URLSearchParams API
 // ============================================
@@ -2049,6 +2246,58 @@ if (typeof URL === 'undefined') {
 
         toJSON() {
             return this.href;
+        }
+
+        /**
+         * 创建 Blob 或 MediaSource 的对象 URL
+         * @param {Blob|MediaSource} obj - Blob 或 MediaSource 对象
+         * @returns {string} 对象 URL
+         */
+        static createObjectURL(obj) {
+            if (!obj) {
+                throw new TypeError("Failed to execute 'createObjectURL' on 'URL': 1 argument required, but only 0 present.");
+            }
+
+            // 检查是否为 Blob 或类 Blob 对象
+            if (!(obj instanceof Blob) && !(obj._parts !== undefined)) {
+                throw new TypeError("Failed to execute 'createObjectURL' on 'URL': Overload resolution failed.");
+            }
+
+            // 生成唯一 URL
+            const id = `blob-${_objectURLCounter++}-${Math.random().toString(36).substr(2, 9)}`;
+            const blobUrl = `blob:neverjscore/${id}`;
+
+            // 存储 Blob 对象
+            _objectURLStore.set(blobUrl, obj);
+
+            log(`URL.createObjectURL: ${blobUrl}, size=${obj.size || 0}, type=${obj.type || ''}`);
+
+            return blobUrl;
+        }
+
+        /**
+         * 撤销对象 URL
+         * @param {string} url - 要撤销的对象 URL
+         */
+        static revokeObjectURL(url) {
+            if (typeof url !== 'string') {
+                return;
+            }
+
+            if (_objectURLStore.has(url)) {
+                _objectURLStore.delete(url);
+                log(`URL.revokeObjectURL: ${url}`);
+            }
+        }
+
+        /**
+         * 获取对象 URL 对应的 Blob（内部方法，供其他 API 使用）
+         * @private
+         * @param {string} url - 对象 URL
+         * @returns {Blob|null} Blob 对象或 null
+         */
+        static _getObjectURL(url) {
+            return _objectURLStore.get(url) || null;
         }
     }
 

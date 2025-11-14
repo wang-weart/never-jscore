@@ -18,12 +18,19 @@ pub fn op_store_result(state: &mut OpState, #[string] value: String) {
 ///
 /// 用于在JS执行过程中提前返回结果并终止执行。
 /// 这在逆向工程中非常有用，例如Hook XMLHttpRequest.send拦截参数。
-#[op2(fast)]
-pub fn op_early_return(state: &mut OpState, #[string] value: String) {
+///
+/// 实现方式：存储值到 ResultStorage 并标记为早期返回，
+/// 然后抛出 JS Error 来中断执行
+#[op2]
+#[string]
+pub fn op_early_return(state: &mut OpState, #[string] value: String) -> String {
     if let Some(storage) = state.try_borrow_mut::<Rc<ResultStorage>>() {
-        storage.store(value);
+        storage.store(value.clone());
         storage.mark_early_return();
     }
+    // 抛出 JS Error 来中断执行
+    // 使用 #[string] 返回值，然后在 JS 端转为 throw
+    value
 }
 
 // 扩展

@@ -7,6 +7,7 @@ use std::cell::RefCell;
 pub struct ResultStorage {
     pub value: RefCell<Option<String>>,
     early_return: RefCell<bool>,  // 标记是否是提前返回（用于Hook拦截）
+    terminated: RefCell<bool>,    // 标记是否应该终止runtime
 }
 
 impl ResultStorage {
@@ -14,12 +15,14 @@ impl ResultStorage {
         Self {
             value: RefCell::new(None),
             early_return: RefCell::new(false),
+            terminated: RefCell::new(false),
         }
     }
 
     pub fn clear(&self) {
         *self.value.borrow_mut() = None;
         *self.early_return.borrow_mut() = false;
+        *self.terminated.borrow_mut() = false;
     }
 
     pub fn store(&self, value: String) {
@@ -38,6 +41,16 @@ impl ResultStorage {
     /// 检查是否是提前返回
     pub fn is_early_return(&self) -> bool {
         *self.early_return.borrow()
+    }
+
+    /// 标记为已终止（强制停止runtime）
+    pub fn mark_terminated(&self) {
+        *self.terminated.borrow_mut() = true;
+    }
+
+    /// 检查是否应该终止
+    pub fn is_terminated(&self) -> bool {
+        *self.terminated.borrow()
     }
 }
 

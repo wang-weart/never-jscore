@@ -388,9 +388,97 @@ with never_jscore.Context() as ctx:
 
 ### Q: with 语句为什么在循环中会崩溃？
 
-**A**: Python 的 with 语句结束后对象还在内存中，未被立即 GC。解决方案：使用函数作用域包装。详见 `WITH_STATEMENT_FIX.md`。
+**A**: Python 的 with 语句结束后对象还在内存中,未被立即 GC。解决方案：使用函数作用域包装。详见 `WITH_STATEMENT_FIX.md`。
+
+### Q: compile() 和 evaluate() 有什么区别？
+
+**A**: 这是一个重要的区别：
+
+- **compile()**：
+  - 用于**定义函数和变量**
+  - 只运行微任务队列（queueMicrotask）
+  - **不等待 setTimeout/setInterval**
+  - 适合加载 JS 库和定义函数
+
+- **evaluate() / eval()**：
+  - 用于**执行代码并获取结果**
+  - 运行完整 event loop
+  - **会等待 setTimeout 和 Promise**
+  - 适合执行异步代码
+
+**典型场景**：
+```python
+# 定义函数 - 用 compile
+ctx.compile("""
+    function encrypt(data) {
+        return new Promise(resolve => {
+            setTimeout(() => {
+                resolve(btoa(data));
+            }, 100);
+        });
+    }
+""")
+
+# 调用函数 - 用 call（自动等待 Promise）
+result = ctx.call("encrypt", ["hello"])
+
+# 一次性执行 - 用 evaluate
+result = ctx.evaluate("""
+    (async () => {
+        await new Promise(r => setTimeout(r, 1000));
+        return 'done';
+    })()
+""")
+```
 
 ## 更新日志
+
+### v2.3.2 (2025-11-14) - Timer 修复与 API 说明
+
+- 🐛 **修复 Timer Reactor 错误**：修复了 setTimeout/setInterval 在某些场景下的 "no reactor running" 崩溃问题
+  - 从 `tokio::sync::oneshot` 改为使用 `tokio::time::sleep`
+  - 确保 timer 在 Tokio runtime 上下文中正确执行
+- 📚 **compile() vs evaluate() 说明**：
+  - `compile()` - 用于**定义函数和变量**，只运行微任务队列，**不等待 setTimeout**
+  - `evaluate()` / `eval()` - 用于**执行异步代码**，运行完整 event loop，**会等待 setTimeout/Promise**
+  - ⚠️ **重要**：如果代码顶层有 `setTimeout` 调用，应使用 `evaluate()` 而非 `compile()`
+- 🔧 改进错误提示和文档说明
+
+**使用示例**：
+```python
+import never_jscore
+
+ctx = never_jscore.Context(enable_extensions=True)
+
+# ❌ 错误：compile 不等待 setTimeout
+ctx.compile("""
+    setTimeout(() => {
+        console.log('这不会执行');
+    }, 1000);
+""")
+
+# ✅ 正确：evaluate 会等待 setTimeout
+ctx.evaluate("""
+    (async () => {
+        await new Promise(resolve => {
+            setTimeout(() => {
+                console.log('这会执行');
+                resolve();
+            }, 1000);
+        });
+    })()
+""")
+
+# ✅ 推荐：compile 定义函数，call 调用
+ctx.compile("""
+    function waitAndReturn(value) {
+        return new Promise(resolve => {
+            setTimeout(() => resolve(value), 1000);
+        });
+    }
+""")
+result = ctx.call("waitAndReturn", ["hello"])  # 自动等待 Promise
+```
 
 ### v2.3.1 (2025-11-13) - 多线程完善
 

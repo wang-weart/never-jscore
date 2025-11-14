@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use crate::convert::{json_to_python, python_to_json};
 use crate::ops;
-use crate::runtime::{ensure_v8_initialized, run_with_tokio};
+use crate::runtime::run_with_tokio;
 use crate::storage::ResultStorage;
 
 // ============================================
@@ -70,7 +70,7 @@ impl Context {
             extensions.push(crate::random_ops::random_ops::init());  // Random seed control (always loaded with extensions)
             extensions.push(crate::crypto_ops::crypto_ops::init());
             extensions.push(crate::encoding_ops::encoding_ops::init());
-            // Use real async timers instead of fake ones
+            // Real async timers (using channel + thread to avoid Tokio reactor issues)
             extensions.push(crate::timer_real_ops::timer_real_ops::init());
             extensions.push(crate::worker_ops::worker_ops::init());
             extensions.push(crate::fs_ops::fs_ops::init());
@@ -135,6 +135,18 @@ impl Context {
         // Leak the v8::Global to avoid HandleScope issues on drop
         std::mem::forget(result);
 
+        // 简化的定时器处理：只运行 event loop 来处理微任务
+        // 定时器通过 queueMicrotask 自动调度，依赖真实时间
+        drop(runtime);
+
+        // 使用 Tokio 运行 event loop (处理 queueMicrotask 队列)
+        run_with_tokio(async {
+            let mut rt = self.runtime.borrow_mut();
+
+            // 运行 event loop 直到微任务队列为空
+            rt.run_event_loop(Default::default()).await.ok();
+        });
+
         // 更新执行计数
         let mut count = self.exec_count.borrow_mut();
         *count += 1;
@@ -151,113 +163,101 @@ impl Context {
     ///
     /// 根据 auto_await 参数决定是否自动等待 Promise。
     /// 注意：这个方法用于求值，代码在IIFE中执行，不会影响全局作用域
+    ///
+    /// Early Return 机制：
+    /// - 当 JS 调用 __neverjscore_return__(value) 时，会抛出 EarlyReturnError
+    /// - 该错误会携带返回值并中断 JS 执行
+    /// - Rust 侧通过 downcast 检测并提取返回值
     fn execute_js(&self, code: &str, auto_await: bool) -> Result<String> {
         self.result_storage.clear();
 
         if auto_await {
             // 异步模式：自动等待 Promise
-            // 使用线程本地的单线程 Tokio runtime
             run_with_tokio(async {
                 let mut runtime = self.runtime.borrow_mut();
 
-                // 使用 JSON 序列化来安全转义代码字符串（处理所有特殊字符）
+                // 序列化代码
                 let code_json = serde_json::to_string(code)
                     .map_err(|e| anyhow!("Failed to serialize code: {}", e))?;
 
-                // 包装代码以自动等待 Promise
+                // 简化的包装：只需要 async 函数和结果存储
                 let wrapped_code = format!(
                     r#"
                     (async function() {{
+                        const code = {};
+                        const __result = await Promise.resolve(eval(code));
+
+                        if (__result === undefined) {{
+                            Deno.core.ops.op_store_result("null");
+                            return null;
+                        }}
+
                         try {{
-                            const code = {};
-                            const __result = await Promise.resolve(eval(code));
-                            if (__result === undefined) {{
-                                Deno.core.ops.op_store_result("null");
-                                return null;
-                            }}
-                            try {{
-                                const json = JSON.stringify(__result);
-                                Deno.core.ops.op_store_result(json);
-                                return __result;
-                            }} catch(e) {{
-                                const str = JSON.stringify(String(__result));
-                                Deno.core.ops.op_store_result(str);
-                                return __result;
-                            }}
-                        }} catch(err) {{
-                            throw err;
+                            const json = JSON.stringify(__result);
+                            Deno.core.ops.op_store_result(json);
+                            return __result;
+                        }} catch(e) {{
+                            const str = JSON.stringify(String(__result));
+                            Deno.core.ops.op_store_result(str);
+                            return __result;
                         }}
                     }})()
                     "#,
                     code_json
                 );
 
-                let _result = runtime
-                    .execute_script("<eval_async>", wrapped_code)
-                    .map_err(|e| {
-                        // 检查是否是提前返回信号
-                        let err_str = format!("{:?}", e);
-                        if err_str.contains("NEVER_JSCORE_EARLY_RETURN") || err_str.contains("EarlyReturnSignal") {
-                            // 这是提前返回，不是真正的错误
-                            return anyhow!("Early return detected");
+                // 执行脚本
+                let execute_result = runtime.execute_script("<eval_async>", wrapped_code);
+
+                // 检查是否是 EarlyReturnError
+                match execute_result {
+                    Err(e) => {
+                        // 检查是否是早期返回
+                        if self.result_storage.is_early_return() {
+                            // 提前返回：直接返回存储的值
+                            let result = self.result_storage.take()
+                                .ok_or_else(|| anyhow!("Early return but no result stored"))?;
+                            let mut count = self.exec_count.borrow_mut();
+                            *count += 1;
+                            return Ok(result);
                         }
-                        anyhow!("Execution failed: {:?}", e)
-                    })?;
-
-                // Leak the v8::Global to avoid HandleScope issues
-                std::mem::forget(_result);
-
-                // 检查是否是提前返回
-                if self.result_storage.is_early_return() {
-                    // 提前返回：直接获取结果，不需要运行event loop
-                    let result = self
-                        .result_storage
-                        .take()
-                        .ok_or_else(|| anyhow!("Early return but no result stored"))?;
-
-                    // 清理标志
-                    self.result_storage.clear();
-
-                    // 更新执行计数
-                    let mut count = self.exec_count.borrow_mut();
-                    *count += 1;
-
-                    return Ok(result);
+                        // 其他错误
+                        return Err(anyhow!("Execution error: {:?}", e));
+                    }
+                    Ok(result_handle) => {
+                        // 正常执行，leak handle
+                        std::mem::forget(result_handle);
+                    }
                 }
 
                 // 运行 event loop 等待 Promise 完成
-                runtime
+                let event_loop_result = runtime
                     .run_event_loop(Default::default())
-                    .await
-                    .map_err(|e| {
-                        // 检查是否是提前返回信号
-                        let err_str = format!("{:?}", e);
-                        if err_str.contains("NEVER_JSCORE_EARLY_RETURN") || err_str.contains("EarlyReturnSignal") {
-                            // 这是提前返回，不是真正的错误
-                            return anyhow!("Early return in event loop");
-                        }
-                        anyhow!("Event loop error: {:?}", e)
-                    })?;
+                    .await;
 
+                // 检查 event loop 是否遇到 EarlyReturnError
+                if let Err(e) = event_loop_result {
+                    // 检查是否是早期返回
+                    if self.result_storage.is_early_return() {
+                        // Event loop 中的提前返回
+                        let result = self.result_storage.take()
+                            .ok_or_else(|| anyhow!("Early return but no result stored"))?;
+                        let mut count = self.exec_count.borrow_mut();
+                        *count += 1;
+                        return Ok(result);
+                    }
+                    // 其他错误
+                    return Err(anyhow!("Event loop error: {:?}", e));
+                }
+
+                // 正常完成：从 result_storage 获取结果
                 let result = self
                     .result_storage
                     .take()
-                    .ok_or_else(|| anyhow!("No result stored"))?;
+                    .ok_or_else(|| anyhow!("No result stored after event loop"))?;
 
-                // 再次检查提前返回（可能在event loop中发生）
-                if self.result_storage.is_early_return() {
-                    self.result_storage.clear();
-                }
-
-                // 更新执行计数
                 let mut count = self.exec_count.borrow_mut();
                 *count += 1;
-
-                // 每 100 次执行后提示 GC
-                if *count % 100 == 0 {
-                    drop(runtime);
-                    std::hint::black_box(());
-                }
 
                 Ok(result)
             })
@@ -265,7 +265,6 @@ impl Context {
             // 同步模式：不等待 Promise
             let mut runtime = self.runtime.borrow_mut();
 
-            // 使用 JSON 序列化来安全转义代码字符串（处理所有特殊字符）
             let code_json = serde_json::to_string(code)
                 .map_err(|e| anyhow!("Failed to serialize code: {}", e))?;
 
@@ -294,44 +293,38 @@ impl Context {
 
             let execute_result = runtime.execute_script("<eval_sync>", wrapped_code);
 
-            // 检查是否是提前返回
-            let is_early_return = if let Err(ref e) = execute_result {
-                let err_str = format!("{:?}", e);
-                err_str.contains("NEVER_JSCORE_EARLY_RETURN") || err_str.contains("EarlyReturnSignal")
-            } else {
-                false
-            };
-
-            if is_early_return {
-                // 提前返回：不需要处理执行结果
-            } else {
-                // 不是提前返回：检查错误并leak结果
-                let result_handle = execute_result
-                    .map_err(|e| anyhow!("Execution failed: {:?}", e))?;
-                std::mem::forget(result_handle);
+            // 检查是否是 EarlyReturnError
+            match execute_result {
+                Err(e) => {
+                    // 检查是否是早期返回
+                    if self.result_storage.is_early_return() {
+                        // 提前返回
+                        let result = self.result_storage.take()
+                            .ok_or_else(|| anyhow!("Early return but no result stored"))?;
+                        let mut count = self.exec_count.borrow_mut();
+                        *count += 1;
+                        return Ok(result);
+                    }
+                    return Err(anyhow!("Execution error: {:?}", e));
+                }
+                Ok(result_handle) => {
+                    std::mem::forget(result_handle);
+                }
             }
 
+            // 从 storage 获取结果
             let result = self
                 .result_storage
                 .take()
                 .ok_or_else(|| anyhow!("No result stored"))?;
 
-            // 清理提前返回标志
-            if self.result_storage.is_early_return() {
-                self.result_storage.clear();
-            }
-
             let mut count = self.exec_count.borrow_mut();
             *count += 1;
-
-            if *count % 100 == 0 {
-                drop(runtime);
-                std::hint::black_box(());
-            }
 
             Ok(result)
         }
     }
+
 
     /// 请求垃圾回收
     fn request_gc(&self) -> Result<()> {

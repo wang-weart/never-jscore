@@ -3,6 +3,7 @@ mod convert;
 mod ops;
 mod runtime;
 mod storage;
+mod early_return;  // New: Custom error for early return
 mod crypto_ops;
 mod encoding_ops;
 mod timer_ops;

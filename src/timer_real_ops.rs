@@ -1,13 +1,11 @@
-// timer_real_ops.rs - Real async timer implementation for proper Node.js compatibility
+// timer_real_ops.rs - Real async timer implementation using tokio::time::sleep
 //
-// This replaces the fake immediate-execution timers with real async timers
-// that properly integrate with the event loop.
+// Uses tokio::time::sleep which works with the Tokio runtime
 
 use deno_core::{extension, op2};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Duration;
-use tokio::time::sleep;
 
 // Thread-local storage for timer tracking
 thread_local! {
@@ -20,27 +18,24 @@ thread_local! {
 // ============================================
 
 #[op2(async)]
-/// Real async setTimeout - actually waits for the specified delay
+/// Real async setTimeout - uses tokio::time::sleep
 pub async fn op_set_timeout_real(
     #[smi] timer_id: i32,
     #[smi] delay: i32,
 ) -> bool {
-    // Store that this timer is active
     ACTIVE_TIMERS.with(|timers| {
         timers.borrow_mut().insert(timer_id, true);
     });
 
-    // Actually sleep for the delay
     if delay > 0 {
-        sleep(Duration::from_millis(delay as u64)).await;
+        // Use tokio::time::sleep
+        tokio::time::sleep(Duration::from_millis(delay as u64)).await;
     }
 
-    // Check if timer was cancelled during sleep
     let should_execute = ACTIVE_TIMERS.with(|timers| {
         timers.borrow().get(&timer_id).copied().unwrap_or(false)
     });
 
-    // Clean up
     ACTIVE_TIMERS.with(|timers| {
         timers.borrow_mut().remove(&timer_id);
     });
@@ -77,15 +72,15 @@ pub async fn op_set_interval_real(
     #[smi] timer_id: i32,
     #[smi] delay: i32,
 ) -> bool {
-    // Same implementation as setTimeout
-    // JS layer handles the re-scheduling
+    // Same implementation as setTimeout - JS layer handles re-scheduling
 
     ACTIVE_TIMERS.with(|timers| {
         timers.borrow_mut().insert(timer_id, true);
     });
 
     if delay > 0 {
-        sleep(Duration::from_millis(delay as u64)).await;
+        // Use tokio::time::sleep
+        tokio::time::sleep(Duration::from_millis(delay as u64)).await;
     }
 
     let should_execute = ACTIVE_TIMERS.with(|timers| {
